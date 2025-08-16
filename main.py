@@ -22,7 +22,7 @@ _db_lock = asyncio.Lock()
 
 ADMIN_USER_IDS = {440893662701027328, 716667546241335328}
 
-# ダイス絵文字
+# ダイス絵文字（アニメ用）
 DICE_FACES = {1:"⚀",2:"⚁",3:"⚂",4:"⚃",5:"⚄",6:"⚅"}
 def dice_face_str(vals: List[int]) -> str:
     return " ".join(DICE_FACES[v] for v in vals)
@@ -99,16 +99,19 @@ class RoundState:
         self.final: Optional[HandResult] = None
 
 class GameState:
-    def __init__(self, channel_id: int):
+    def __init__(self, channel_id: int, host_id: int):
         self.channel_id = channel_id
+        self.host_id = host_id         # ロビー作成者
         self.lobby_open = True
+        self.lobby_message_id: Optional[int] = None
+
         self.participants: List[int] = []    # 参加者（親決め対象）
-        self.parent_id: Optional[int] = None # 現親
-        self.bets: Dict[int, int] = {}       # 子 -> ベット額
-        self.children_order: List[int] = []  # 今ラウンドの子順
+        self.parent_id: Optional[int] = None  # 現親
+        self.bets: Dict[int, int] = {}        # 子 -> ベット額
+        self.children_order: List[int] = []   # 今ラウンドの子順
         self.turn_index = 0
         self.parent_hand: Optional[HandResult] = None
-        self.phase: str = "lobby"            # lobby -> choose_parent -> betting -> parent_roll -> children_roll
+        self.phase: str = "lobby"             # lobby -> choose_parent -> betting -> parent_roll -> children_roll
         self.parent_round: Optional[RoundState] = None
         self.child_round: Optional[RoundState] = None
         self.current_view: Optional[discord.ui.View] = None
@@ -143,6 +146,27 @@ def load_balances():
         except Exception:
             continue
 
+# ================== 表示ユーティリティ ==================
+def lobby_text(game: GameState) -> str:
+    mems = "、".join(f"<@{u}>" for u in game.participants) if game.participants else "—"
+    return (
+        "🎲 **チンチロ ロビー**\n"
+        f"ホスト：<@{game.host_id}>\n"
+        f"参加者：{mems}\n\n"
+        "Joinで参加、Leaveで退出。ホストは「親を決める」で開始します。"
+    )
+
+def build_dice_files(dice: List[int]) -> List[discord.File]:
+    files = []
+    for i, n in enumerate(dice, start=1):
+        path = f"assets/dice/dice_{n}.png"
+        files.append(discord.File(path, filename=f"dice_{i}_{n}.png"))
+    return files
+
+async def send_dice_result_with_images(channel, who_mention: str, role_label: str, dice: List[int], hand_label: str, tries: int):
+    text = f"{role_label} {who_mention} のロール #{tries}\n→ **{hand_label}**"
+    await channel.send(content=text, files=build_dice_files(dice))
+
 # ================== アニメ演出 ==================
 async def animate_roll(channel: discord.abc.Messageable, title: str, frames: int = 8, interval: float = 0.15) -> Tuple[discord.Message, List[int]]:
     cur = [random.randint(1,6) for _ in range(3)]
@@ -159,6 +183,87 @@ async def animate_roll(channel: discord.abc.Messageable, title: str, frames: int
 def roll_dice() -> List[int]:
     return [random.randint(1,6) for _ in range(3)]
 
+# ================== ロビービュー（参加ボタン） ==================
+class LobbyView(discord.ui.View):
+    def __init__(self, game: GameState, timeout: Optional[float] = 3600):
+        super().__init__(timeout=timeout)
+        self.game = game
+
+    async def update_panel(self, message: discord.Message):
+        await message.edit(content=lobby_text(self.game), view=self)
+
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.success)
+    async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = self.game
+        await interaction.response.defer(ephemeral=True)
+        uid = interaction.user.id
+        if not game.lobby_open:
+            await interaction.followup.send("ロビーは締め切られています。", ephemeral=True)
+            return
+        if uid in game.participants:
+            await interaction.followup.send("すでに参加しています。", ephemeral=True)
+            return
+        game.participants.append(uid)
+        get_player_state(uid)
+        await save_balances()
+        await interaction.followup.send("参加しました。", ephemeral=True)
+        await self.update_panel(interaction.message)
+
+    @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger)
+    async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = self.game
+        await interaction.response.defer(ephemeral=True)
+        uid = interaction.user.id
+        if uid in game.participants:
+            game.participants.remove(uid)
+            await interaction.followup.send("退出しました。", ephemeral=True)
+            await self.update_panel(interaction.message)
+        else:
+            await interaction.followup.send("参加していません。", ephemeral=True)
+
+    @discord.ui.button(label="親を決める", style=discord.ButtonStyle.primary)
+    async def decide_parent_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = self.game
+        await interaction.response.defer()
+        if interaction.user.id not in (game.host_id, *ADMIN_USER_IDS):
+            await interaction.followup.send("ホストのみが開始できます。", ephemeral=True)
+            return
+        if not game.participants or len(game.participants) < 2:
+            await interaction.followup.send("参加者が2人以上必要です。", ephemeral=True)
+            return
+        if not game.lobby_open:
+            await interaction.followup.send("すでに開始済みです。", ephemeral=True)
+            return
+
+        # 締切
+        game.lobby_open = False
+        game.phase = "choose_parent"
+        await interaction.followup.send("▶ 親決めを開始します。全員が同時にロールします…")
+
+        best_uid = None
+        best_hand: Optional[HandResult] = None
+        texts = []
+        for uid in game.participants:
+            user = await bot.fetch_user(uid)
+            _, dice = await animate_roll(interaction.channel, title=f"【親決め】{user.display_name} のロール中…", frames=6, interval=0.12)
+            hand = evaluate_hand(dice)
+            texts.append(f"<@{uid}>: {dice_face_str(dice)} → **{hand}**")
+            if best_hand is None:
+                best_uid, best_hand = uid, hand
+            else:
+                cmp = compare(best_hand, hand)
+                if cmp < 0:
+                    best_uid, best_hand = uid, hand
+
+        await interaction.channel.send("結果：\n" + "\n".join(texts))
+        game.parent_id = best_uid
+        game.children_order = [uid for uid in game.participants if uid != best_uid]
+        await interaction.channel.send(
+            f"👑 親は <@{best_uid}> に決定！ 子は `/chi_bet amount:<金額>` でベットしてください。"
+            "親は `/chi_parent_roll` で開始できます。"
+        )
+        game.phase = "betting"
+
 # ================== ROLL/STOP ビュー ==================
 class RollView(discord.ui.View):
     def __init__(self, game: GameState, round_state: RoundState, is_parent: bool, timeout: Optional[float] = 120):
@@ -168,25 +273,16 @@ class RollView(discord.ui.View):
         self.is_parent = is_parent
         self.working = False
 
-    async def _finish_if_both_final(self, channel: discord.abc.Messageable):
-        # 親ターン中は子はまだ始まっていないので不要
-        if self.game.phase == "children_roll":
-            # 子の勝負が確定したら即精算して次の子へ
-            if self.round_state.final is not None:
-                await conclude_child_vs_parent(channel, self.game, child_id=self.round_state.user_id, child_hand=self.round_state.final)
-
     async def _finalize_parent_and_move_on(self, channel: discord.abc.Messageable):
         hand = self.round_state.final
         assert hand is not None
-        # 親の特例
-        if hand.rank == 5:  # シゴロ
+        if hand.rank == 5:      # シゴロ
             await conclude_parent_auto_win(channel, self.game, reason="シゴロ")
-        elif hand.rank == 1:  # ヒフミ
+        elif hand.rank == 1:    # ヒフミ
             await conclude_parent_auto_loss(channel, self.game, reason="ヒフミ")
-        elif hand.rank == 4:  # ゾロ目
+        elif hand.rank == 4:    # ゾロ目
             await conclude_parent_auto_win(channel, self.game, reason="ゾロ目")
         else:
-            # 通常役 → 子ターンへ
             self.game.parent_hand = hand
             await start_children_turns(channel, self.game)
 
@@ -209,45 +305,52 @@ class RollView(discord.ui.View):
             self.working = True
             self.round_state.tries += 1
 
-            # 押下中はボタン無効化
+            # 1) 最初に defer
+            await interaction.response.defer()
+
+            # 2) ボタン無効化
             for child in self.children:
                 child.disabled = True
-            await interaction.response.edit_message(view=self)
+            await interaction.edit_original_response(view=self)
 
-            # アニメ → 出目確定
+            # 3) 演出（テキストアニメを followup メッセージで）
             title = f"{self.round_state.role_label} {interaction.user.mention} のロール中…"
-            await interaction.response.defer()
-            msg, _ = await animate_roll(interaction.channel, title=title, frames=8, interval=0.15)
+            anim_msg, _ = await animate_roll(interaction.channel, title=title, frames=8, interval=0.15)
 
+            # 4) 実サイコロ確定
             dice = roll_dice()
             self.round_state.last_roll = dice
             hand = evaluate_hand(dice)
-
-            # 役が付いたら即確定 / 3回目も強制確定
             if hand.rank != 2 or self.round_state.tries >= 3:
                 self.round_state.final = hand
 
-            # 表示更新
+            # 5) アニメの最終テキスト更新
             base = f"{self.round_state.role_label} {interaction.user.mention} のロール #{self.round_state.tries}\n{dice_face_str(dice)} → **{hand.label}**"
             if self.round_state.final and hand.rank == 2:
                 base += "（役なし確定）"
+            await anim_msg.edit(content=base)
 
+            # 6) 画像3枚で確定結果を別送
+            await send_dice_result_with_images(
+                interaction.channel,
+                who_mention=interaction.user.mention,
+                role_label=self.round_state.role_label,
+                dice=dice,
+                hand_label=hand.label,
+                tries=self.round_state.tries
+            )
+
+            # 7) 分岐
             if self.round_state.final:
-                # 確定 → ボタン削除
-                await msg.edit(content=base)
-                for child in self.children:
-                    child.disabled = True
-                await msg.edit(content=base, view=None)
-
+                await interaction.edit_original_response(view=None)
                 if self.is_parent:
                     await self._finalize_parent_and_move_on(interaction.channel)
                 else:
-                    await self._finish_if_both_final(interaction.channel)
+                    await conclude_child_vs_parent(interaction.channel, self.game, child_id=self.round_state.user_id, child_hand=hand)
             else:
-                # まだ振れる → ボタン再有効化
                 for child in self.children:
                     child.disabled = False
-                await msg.edit(content=base)
+                await interaction.edit_original_response(view=self)
 
             self.working = False
 
@@ -264,18 +367,24 @@ class RollView(discord.ui.View):
             return
 
         async with self.game.lock:
-            # 直近の出目で確定
+            await interaction.response.defer()
             hand = evaluate_hand(self.round_state.last_roll)
             self.round_state.final = hand
 
-            # 結果通知
-            text = f"{self.round_state.role_label} {interaction.user.mention} はここでSTOP。\n{dice_face_str(self.round_state.last_roll)} → **{hand.label}**（確定）"
-            await interaction.response.send_message(text)
+            await send_dice_result_with_images(
+                interaction.channel,
+                who_mention=interaction.user.mention,
+                role_label=self.round_state.role_label,
+                dice=self.round_state.last_roll,
+                hand_label=f"{hand.label}（STOPで確定）",
+                tries=self.round_state.tries
+            )
+            await interaction.edit_original_response(view=None)
 
             if self.is_parent:
                 await self._finalize_parent_and_move_on(interaction.channel)
             else:
-                await self._finish_if_both_final(interaction.channel)
+                await conclude_child_vs_parent(interaction.channel, self.game, child_id=self.round_state.user_id, child_hand=hand)
 
 # ================== 進行ユーティリティ ==================
 async def conclude_parent_auto_win(channel: discord.abc.Messageable, game: GameState, reason: str):
@@ -308,7 +417,6 @@ async def start_children_turns(channel: discord.abc.Messageable, game: GameState
 
 async def prompt_next_child(channel: discord.abc.Messageable, game: GameState):
     if game.turn_index >= len(game.children_order):
-        # 全員終了 → 親交代
         await end_round_and_rotate_parent(channel, game)
         return
     cid = game.children_order[game.turn_index]
@@ -328,13 +436,11 @@ async def conclude_child_vs_parent(channel: discord.abc.Messageable, game: GameS
     if res == 0:
         await channel.send(f"🔸 引き分け：親 **{parent_hand}** vs 子 **{child_hand}**（精算なし）")
     elif res > 0:
-        # 子勝ち → 親が子へ支払い（等倍）
         child_ps.balance += bet
         parent_ps.balance -= bet
         await channel.send(f"🟢 子 <@{child_id}> の勝ち！ 親 **{parent_hand}** / 子 **{child_hand}** → 子 +{bet}")
         await save_balances()
     else:
-        # 子負ち → 子が親へ支払い（等倍）
         child_ps.balance -= bet
         parent_ps.balance += bet
         await channel.send(f"🔴 子 <@{child_id}> の負け… 親 **{parent_hand}** / 子 **{child_hand}** → 子 -{bet}")
@@ -348,10 +454,9 @@ async def end_round_and_rotate_parent(channel: discord.abc.Messageable, game: Ga
         await channel.send("参加者がいないため終了します。")
         GAMES.pop(game.channel_id, None)
         return
-    # 次の親は子からランダム選出
     candidates = [uid for uid in game.participants if uid != game.parent_id]
     if not candidates:
-        candidates = game.participants[:]  # 念のため
+        candidates = game.participants[:]
     next_parent = random.choice(candidates)
     await channel.send(f"✅ ラウンド終了。次の親はランダム選出 → <@{next_parent}>")
 
@@ -366,70 +471,39 @@ async def end_round_and_rotate_parent(channel: discord.abc.Messageable, game: Ga
     await channel.send(f"▶ 新ラウンド開始。親：<@{game.parent_id}>。子は `/chi_bet amount:<金額>` でベットしてください。親は `/chi_parent_roll` で開始できます。")
 
 # ================== Slash Commands ==================
-@tree.command(name="chi_ready", description="チンチロのロビーを作成（親は後で親決めロール）")
+@tree.command(name="chi_ready", description="チンチロのロビーを作成（ボタンで参加）")
 async def chi_ready(interaction: discord.Interaction):
     cid = interaction.channel_id
-    if cid in GAMES and GAMES[cid].lobby_open is True:
+    if cid in GAMES and GAMES[cid].lobby_open:
         await interaction.response.send_message("このチャンネルには既にロビーがあります。", ephemeral=True)
         return
-    GAMES[cid] = GameState(channel_id=cid)
-    await interaction.response.send_message("🎲 ロビーを作成しました。`/chi_join` で参加してください。`/chi_decide_parent` で親決めをします。")
 
-@tree.command(name="chi_join", description="ロビーに参加")
-async def chi_join(interaction: discord.Interaction):
+    game = GameState(channel_id=cid, host_id=interaction.user.id)
+    GAMES[cid] = game
+
+    view = LobbyView(game)
+    await interaction.response.send_message(lobby_text(game), view=view)
+    sent = await interaction.original_response()
+    game.lobby_message_id = sent.id
+    game.current_view = view
+
+@tree.command(name="chi_panel", description="（ホスト）参加パネルを再送")
+async def chi_panel(interaction: discord.Interaction):
     cid = interaction.channel_id
     game = GAMES.get(cid)
-    if not game or not game.lobby_open:
-        await interaction.response.send_message("参加可能なロビーがありません。", ephemeral=True)
+    if not game:
+        await interaction.response.send_message("このチャンネルにロビー/ゲームはありません。", ephemeral=True)
         return
-    uid = interaction.user.id
-    if uid in game.participants:
-        await interaction.response.send_message("すでに参加しています。", ephemeral=True)
+    if interaction.user.id not in (game.host_id, *ADMIN_USER_IDS):
+        await interaction.response.send_message("ホストのみ実行できます。", ephemeral=True)
         return
-    game.participants.append(uid)
-    get_player_state(uid)  # 残高初期化
-    await save_balances()
-    await interaction.response.send_message(f"✅ <@{uid}> が参加しました。（現在 {len(game.participants)} 人）")
+    view = LobbyView(game)
+    await interaction.response.send_message(lobby_text(game), view=view)
+    sent = await interaction.original_response()
+    game.lobby_message_id = sent.id
+    game.current_view = view
 
-@tree.command(name="chi_decide_parent", description="参加者で親決めロールを行う（主催者が実行）")
-async def chi_decide_parent(interaction: discord.Interaction):
-    cid = interaction.channel_id
-    game = GAMES.get(cid)
-    if not game or not game.participants:
-        await interaction.response.send_message("参加者がいません。", ephemeral=True)
-        return
-    if not game.lobby_open:
-        await interaction.response.send_message("すでに親決め済みです。", ephemeral=True)
-        return
-
-    game.lobby_open = False
-    game.phase = "choose_parent"
-    await interaction.response.send_message("▶ 親決めを開始します。全員が同時にロールします…")
-
-    await asyncio.sleep(0.5)
-    best_uid = None
-    best_hand: Optional[HandResult] = None
-    texts = []
-    for uid in game.participants:
-        user = await bot.fetch_user(uid)
-        _, dice = await animate_roll(interaction.channel, title=f"【親決め】{user.display_name} のロール中…", frames=6, interval=0.12)
-        hand = evaluate_hand(dice)
-        texts.append(f"<@{uid}>: {dice_face_str(dice)} → **{hand}**")
-        if best_hand is None:
-            best_uid, best_hand = uid, hand
-        else:
-            # 強い方が親
-            cmp = compare(best_hand, hand)
-            if cmp < 0:  # handが上なら更新
-                best_uid, best_hand = uid, hand
-
-    await interaction.channel.send("結果：\n" + "\n".join(texts))
-    game.parent_id = best_uid
-    game.children_order = [uid for uid in game.participants if uid != best_uid]
-    await interaction.channel.send(f"👑 親は <@{best_uid}> に決定！ 子は `/chi_bet amount:<金額>` でベットしてください。親は `/chi_parent_roll` で開始できます。")
-    game.phase = "betting"
-
-@tree.command(name="chi_bet", description="（子）今回の親に対する賭け金を設定（親のロール開始まで有効）")
+@tree.command(name="chi_bet", description="（子）今回の親に対する賭け金を設定（親のロール開始まで）")
 @app_commands.describe(amount="ベット額（0可）")
 async def chi_bet(interaction: discord.Interaction, amount: app_commands.Range[int, 0, 1_000_000]):
     cid = interaction.channel_id
@@ -440,8 +514,8 @@ async def chi_bet(interaction: discord.Interaction, amount: app_commands.Range[i
     if interaction.user.id == game.parent_id:
         await interaction.response.send_message("親はベットできません。", ephemeral=True)
         return
-    if interaction.user.id not in game.children_order:
-        await interaction.response.send_message("今回のラウンドの参加子ではありません。", ephemeral=True)
+    if interaction.user.id not in game.participants:
+        await interaction.response.send_message("今回のゲームの参加者ではありません。", ephemeral=True)
         return
     ps = get_player_state(interaction.user.id)
     if ps.balance < amount:
@@ -461,7 +535,6 @@ async def chi_parent_roll(interaction: discord.Interaction):
         await interaction.response.send_message("親のみが開始できます。", ephemeral=True)
         return
 
-    # ベット締切
     game.phase = "parent_roll"
     game.parent_round = RoundState(user_id=game.parent_id, role_label="【親】")
     view = RollView(game, round_state=game.parent_round, is_parent=True)
@@ -474,6 +547,7 @@ async def chi_status(interaction: discord.Interaction):
     lines = []
     if game:
         lines.append(f"フェーズ：{game.phase}")
+        lines.append(f"ホスト：<@{game.host_id}>")
         lines.append(f"参加者：{'、'.join(f'<@{u}>' for u in game.participants) if game.participants else '—'}")
         lines.append(f"親：{f'<@{game.parent_id}>' if game.parent_id else '—'}")
         if game.children_order:
@@ -485,7 +559,6 @@ async def chi_status(interaction: discord.Interaction):
     else:
         lines.append("このチャンネルにゲームはありません。")
 
-    # 残高（参加者のみ表示）
     balances = []
     ids = set(game.participants) if game else {interaction.user.id}
     for uid in ids:
@@ -493,14 +566,14 @@ async def chi_status(interaction: discord.Interaction):
 
     await interaction.response.send_message("【状態】\n" + "\n".join(lines) + "\n\n【残高】\n" + "\n".join(balances))
 
-@tree.command(name="chi_end", description="ゲームを終了（親または管理者）")
+@tree.command(name="chi_end", description="ゲームを終了（親/ホスト/管理者）")
 async def chi_end(interaction: discord.Interaction):
     cid = interaction.channel_id
     game = GAMES.get(cid)
     if not game:
         await interaction.response.send_message("ゲームはありません。", ephemeral=True)
         return
-    if interaction.user.id not in (game.parent_id, *ADMIN_USER_IDS):
+    if interaction.user.id not in (game.parent_id, game.host_id, *ADMIN_USER_IDS):
         await interaction.response.send_message("終了権限がありません。", ephemeral=True)
         return
     GAMES.pop(cid, None)
