@@ -307,7 +307,7 @@ class LobbyView(discord.ui.View):
                 except Exception: pass
 
             logs.append(f"<@{uid}>: {dice_face_str(dice)} → **{hand}**")
-            if best_hand is None or compare(best_hand, hand) < 0:
+            if best_hand is None or compare(best_hand, hand) > 0:
                 best_uid, best_hand = uid, hand
 
         # 結果発表
@@ -353,7 +353,6 @@ class BetView(discord.ui.View):
         cur = max(0, min(MAX_BET, cur + delta))
         self.game.temp_bets[uid] = cur
         await self._refresh_panel(inter)
-        await inter.followup.send(f"あなたの現在のベット：**{cur}**", ephemeral=True)
 
     @discord.ui.button(label="+100", style=discord.ButtonStyle.success)
     async def plus_btn(self, inter: discord.Interaction, button: discord.ui.Button):
@@ -370,7 +369,6 @@ class BetView(discord.ui.View):
         uid = inter.user.id
         self.game.temp_bets[uid] = 0
         await self._refresh_panel(inter)
-        await inter.followup.send("あなたのベットを **0** にしました。", ephemeral=True)
 
     @discord.ui.button(label="✅ 確定", style=discord.ButtonStyle.primary)
     async def confirm_btn(self, inter: discord.Interaction, button: discord.ui.Button):
@@ -667,3 +665,4 @@ if __name__ == "__main__":
         print("環境変数 DISCORD_TOKEN が設定されていません。")
     else:
         bot.run(TOKEN)
+
