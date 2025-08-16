@@ -7,8 +7,6 @@ from typing import Dict, List, Optional, Tuple
 import discord
 from discord.ext import commands
 from discord import app_commands
-
-# 画像処理
 from PIL import Image
 
 # ================== 基本設定 ==================
@@ -17,41 +15,32 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 INTENTS = discord.Intents.default()
 INTENTS.guilds = True
 INTENTS.members = True
-# Slash/ボタン運用だけなら message_content は不要
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 tree = bot.tree
 
 # ================== 可変設定 ==================
-# ダイス画像格納先（dice_1.png ... dice_6.png を置く）
-DICE_ASSET_DIR = "assets/dice"
-
-# ロール中アニメ（生成ファイルは WebP 失敗時 GIF）
-ROLL_ANIM_FRAMES = 12         # コマ数
-ROLL_ANIM_MS = 90             # 1コマms（約11fps）
-COMPOSITE_GAP = 16            # 合成PNGでのダイス間隔px
+DICE_ASSET_DIR = "assets/dice"  # dice_1.png … dice_6.png を置くフォルダ
+ROLL_ANIM_FRAMES = 12           # アニメコマ数
+ROLL_ANIM_MS = 90               # 1コマms（≈11fps）
+COMPOSITE_GAP = 16              # 合成PNGでのサイコロ間隔
 DELETE_ANIM_AFTER_RESULT = True
 
 # ベットUI
 BET_STEP = 100
 MAX_BET = 1_000_000
 
-# サーバー通貨ボット向けの送金テンプレ
-# {payer} = 支払う側メンション, {payee} = 受取側メンション, {amount} = 金額
-# 例: "!pay {payer} {payee} {amount}" / "vc!tip {payee} {amount}"
+# サーバー通貨ボット向け送金テンプレ
+# {payer} 支払側, {payee} 受取側（いずれもメンション文字列）, {amount} 金額
 TRANSFER_TEMPLATE = "!pay {payer} {payee} {amount}"
 
-# 管理用：即時ギルド同期コマンドを使いたい場合のみ設定（未設定でOK）
-SYNC_ALLOWED_FOR_ADMINS = True
-
-# ================== ユーティリティ ==================
+# ================== 小ユーティリティ ==================
 DICE_FACES = {1:"⚀",2:"⚁",3:"⚂",4:"⚃",5:"⚄",6:"⚅"}
 
 def dice_face_str(vals: List[int]) -> str:
     return " ".join(DICE_FACES[v] for v in vals)
 
 async def ack(inter: discord.Interaction):
-    """Slash開始時のack（defer）。二重応答を防ぐための共通関数。"""
     if not inter.response.is_done():
         await inter.response.defer()
 
@@ -142,7 +131,6 @@ def compose_three_dice_image(dice: List[int], gap: int = COMPOSITE_GAP) -> str:
     return out_path
 
 def make_roll_animation(frames: int = ROLL_ANIM_FRAMES, duration_ms: int = ROLL_ANIM_MS, gap: int = COMPOSITE_GAP) -> tuple[str, List[int]]:
-    """WebP（失敗時GIF）アニメを作り、末尾見た目の出目も返す"""
     sample = _load_die(1)
     die_w, die_h = sample.size
     W = die_w * 3 + gap * 2
@@ -168,10 +156,10 @@ def make_roll_animation(frames: int = ROLL_ANIM_FRAMES, duration_ms: int = ROLL_
     webp_path = f"/tmp/roll_{tmp_id}.webp"
     gif_path  = f"/tmp/roll_{tmp_id}.gif"
     try:
-        seq[0].save(webp_path, save_all=True, append_images=seq[1:], duration=duration_ms, loop=0, disposal=2, format="WEBP")
+        seq[0].save(webp_path, save_all=True, append_images=seq[1:], duration=ROLL_ANIM_MS, loop=0, disposal=2, format="WEBP")
         return webp_path, last_dice
     except Exception:
-        seq[0].save(gif_path, save_all=True, append_images=seq[1:], duration=duration_ms, loop=0, disposal=2, format="GIF")
+        seq[0].save(gif_path, save_all=True, append_images=seq[1:], duration=ROLL_ANIM_MS, loop=0, disposal=2, format="GIF")
         return gif_path, last_dice
 
 async def send_roll_animation(channel: discord.abc.Messageable, title: str) -> tuple[discord.Message, List[int], str]:
@@ -206,7 +194,7 @@ class GameState:
         self.children_order: List[int] = []
 
         self.bets: Dict[int, int] = {}           # 確定ベット
-        self.temp_bets: Dict[int, int] = {}      # クリック中の一時ベット
+        self.temp_bets: Dict[int, int] = {}      # 入力途中の一時ベット
         self.bet_panel_message_id: Optional[int] = None
 
         self.turn_index = 0
@@ -229,7 +217,7 @@ def lobby_text(game: GameState) -> str:
     )
 
 def bet_panel_text(game: GameState) -> str:
-    lines = ["💰 **ベット受付中**（+100/-100 で調整 → ✅確定）"]
+    lines = [f"💰 **ベット受付中**（+100/-100 → ✅確定）  親：<@{game.parent_id}>" if game.parent_id else "💰 **ベット受付中**（+100/-100 → ✅確定）"]
     if not game.children_order:
         lines.append("子がいません。")
     else:
@@ -289,14 +277,12 @@ class LobbyView(discord.ui.View):
         best_hand: Optional[HandResult] = None
         logs = []
 
-        # 1人ずつ：アニメ送信→確定（合成PNG）→アニメ削除
         for uid in self.game.participants:
             user = await bot.fetch_user(uid)
             anim_msg, _, _ = await send_roll_animation(inter.channel, title=f"【親決め】{user.display_name} のロール中…")
             dice = roll_dice()
             hand = evaluate_hand(dice)
 
-            # アニメ「止まった」表現＆確定画像
             try:
                 await anim_msg.edit(content=f"【親決め】{user.display_name} のロール中…\n（…止まりました）")
             except Exception:
@@ -307,16 +293,16 @@ class LobbyView(discord.ui.View):
                 except Exception: pass
 
             logs.append(f"<@{uid}>: {dice_face_str(dice)} → **{hand}**")
+            # hand が現時点の best_hand より強ければ採用
             if best_hand is None or compare(best_hand, hand) > 0:
                 best_uid, best_hand = uid, hand
 
-        # 結果発表
         await inter.channel.send("結果：\n" + "\n".join(logs))
         self.game.parent_id = best_uid
         self.game.children_order = [u for u in self.game.participants if u != best_uid]
         await inter.channel.send(
             f"👑 親は <@{best_uid}> に決定！\n"
-            "このあとベットパネルが出ます。親は開始準備ができたら `/chi_parent_roll` を実行してください。"
+            "このあとベットパネルが出ます。親は準備ができたら開始してください。"
         )
         self.game.phase = "betting"
         await send_bet_panel(inter.channel, self.game)
@@ -353,6 +339,7 @@ class BetView(discord.ui.View):
         cur = max(0, min(MAX_BET, cur + delta))
         self.game.temp_bets[uid] = cur
         await self._refresh_panel(inter)
+        # 通知は出さない（UIだけ更新）
 
     @discord.ui.button(label="+100", style=discord.ButtonStyle.success)
     async def plus_btn(self, inter: discord.Interaction, button: discord.ui.Button):
@@ -369,6 +356,7 @@ class BetView(discord.ui.View):
         uid = inter.user.id
         self.game.temp_bets[uid] = 0
         await self._refresh_panel(inter)
+        # 通知なし
 
     @discord.ui.button(label="✅ 確定", style=discord.ButtonStyle.primary)
     async def confirm_btn(self, inter: discord.Interaction, button: discord.ui.Button):
@@ -379,7 +367,37 @@ class BetView(discord.ui.View):
         self.game.bets[uid] = amt
         self.game.temp_bets.pop(uid, None)
         await self._refresh_panel(inter)
-        await inter.followup.send(f"あなたのベットを **{amt}** に確定しました。", ephemeral=True)
+        # 公開で確定アナウンス
+        await inter.channel.send(f"💰 <@{uid}> のベット：**{amt}**（確定）")
+
+    # 親だけ押せる開始ボタン
+    @discord.ui.button(label="▶ 親のROLL開始", style=discord.ButtonStyle.success, row=1)
+    async def start_parent_roll_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        game = self.game
+        if inter.user.id != game.parent_id:
+            await inter.response.send_message("親のみが開始できます。", ephemeral=True)
+            return
+        if game.phase != "betting":
+            await inter.response.send_message("いまは開始できません。", ephemeral=True)
+            return
+
+        await inter.response.defer()
+        game.phase = "parent_roll"
+
+        # ベット締切：パネルを閉じる
+        if game.bet_panel_message_id:
+            try:
+                panel_msg = await inter.channel.fetch_message(game.bet_panel_message_id)
+                await panel_msg.edit(content="⛔ ベットは締め切りました。", view=None)
+            except Exception:
+                pass
+
+        game.parent_round = RoundState(user_id=game.parent_id, role_label="【親】")
+        view = RollView(game, round_state=game.parent_round, is_parent=True)
+        await inter.followup.send(
+            f"🟨 親 <@{game.parent_id}> の手番です。最大3回までROLL可能、STOPで確定。",
+            view=view
+        )
 
 async def send_bet_panel(channel: discord.abc.Messageable, game: GameState):
     view = BetView(game)
@@ -423,7 +441,7 @@ class RollView(discord.ui.View):
         if self.round_state.final:
             await inter.response.send_message("すでに確定しています。", ephemeral=True); return
         if self.round_state.tries >= 3:
-            await inter.response.send_message("ROLLしてください", ephemeral=True); return
+            await inter.response.send_message("最大3回までです。", ephemeral=True); return
 
         async with self.game.lock:
             self.working = True
@@ -433,7 +451,6 @@ class RollView(discord.ui.View):
             for c in self.children: c.disabled = True
             await inter.edit_original_response(view=self)
 
-            # 画像アニメ → 実サイコロ確定 → 合成PNG → アニメ削除
             title = f"{self.round_state.role_label} {inter.user.mention} のロール中…"
             anim_msg, _, _ = await send_roll_animation(inter.channel, title=title)
 
@@ -515,7 +532,7 @@ async def prompt_next_child(channel: discord.abc.Messageable, game: GameState):
     cid = game.children_order[game.turn_index]
     game.child_round = RoundState(user_id=cid, role_label="【子】")
     view = RollView(game, round_state=game.child_round, is_parent=False)
-    await channel.send(f"🟦 子 <@{cid}> の手番です。役無しの場合は3回までROLL可能、STOPで確定。", view=view)
+    await channel.send(f"🟦 子 <@{cid}> の手番です。最大3回までROLL可能、STOPで確定。", view=view)
 
 async def conclude_child_vs_parent(channel: discord.abc.Messageable, game: GameState, child_id: int, child_hand: HandResult):
     parent_hand = game.parent_hand
@@ -602,7 +619,7 @@ async def chi_parent_roll(inter: discord.Interaction):
 
     game.parent_round = RoundState(user_id=game.parent_id, role_label="【親】")
     view = RollView(game, round_state=game.parent_round, is_parent=True)
-    await inter.followup.send(f"🟨 親 <@{game.parent_id}> の手番です。役無しの場合は3回までROLL可能、STOPで確定。", view=view)
+    await inter.followup.send(f"🟨 親 <@{game.parent_id}> の手番です。最大3回までROLL可能、STOPで確定。", view=view)
 
 @tree.command(name="chi_status", description="状態を表示")
 async def chi_status(inter: discord.Interaction):
@@ -639,18 +656,6 @@ async def chi_end(inter: discord.Interaction):
     GAMES.pop(cid, None)
     await inter.followup.send("🛑 ゲームを終了しました。")
 
-# （任意）即時ギルド同期
-if SYNC_ALLOWED_FOR_ADMINS:
-    @tree.command(name="chi_sync", description="（管理者）このサーバーにSlashコマンドを即時同期")
-    async def chi_sync(inter: discord.Interaction):
-        if not inter.user.guild_permissions.administrator:
-            await inter.response.send_message("管理者のみ実行できます。", ephemeral=True); return
-        await inter.response.defer(ephemeral=True)
-        guild = discord.Object(id=inter.guild_id)
-        tree.copy_global_to(guild=guild)
-        synced = await tree.sync(guild=guild)
-        await inter.followup.send(f"✅ このサーバーに {len(synced)} 件のコマンドを同期しました。", ephemeral=True)
-
 # ================== 起動 ==================
 @bot.event
 async def on_ready():
@@ -665,7 +670,3 @@ if __name__ == "__main__":
         print("環境変数 DISCORD_TOKEN が設定されていません。")
     else:
         bot.run(TOKEN)
-
-
-
-
