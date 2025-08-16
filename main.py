@@ -423,7 +423,7 @@ class RollView(discord.ui.View):
         if self.round_state.final:
             await inter.response.send_message("すでに確定しています。", ephemeral=True); return
         if self.round_state.tries >= 3:
-            await inter.response.send_message("最大3回までです。", ephemeral=True); return
+            await inter.response.send_message("ROLLしてください", ephemeral=True); return
 
         async with self.game.lock:
             self.working = True
@@ -665,4 +665,5 @@ if __name__ == "__main__":
         print("環境変数 DISCORD_TOKEN が設定されていません。")
     else:
         bot.run(TOKEN)
+
 
