@@ -515,7 +515,7 @@ async def prompt_next_child(channel: discord.abc.Messageable, game: GameState):
     cid = game.children_order[game.turn_index]
     game.child_round = RoundState(user_id=cid, role_label="【子】")
     view = RollView(game, round_state=game.child_round, is_parent=False)
-    await channel.send(f"🟦 子 <@{cid}> の手番です。最大3回までROLL可能、STOPで確定。", view=view)
+    await channel.send(f"🟦 子 <@{cid}> の手番です。ROLL可能、STOPで確定。", view=view)
 
 async def conclude_child_vs_parent(channel: discord.abc.Messageable, game: GameState, child_id: int, child_hand: HandResult):
     parent_hand = game.parent_hand
@@ -602,7 +602,7 @@ async def chi_parent_roll(inter: discord.Interaction):
 
     game.parent_round = RoundState(user_id=game.parent_id, role_label="【親】")
     view = RollView(game, round_state=game.parent_round, is_parent=True)
-    await inter.followup.send(f"🟨 親 <@{game.parent_id}> の手番です。最大3回までROLL可能、STOPで確定。", view=view)
+    await inter.followup.send(f"🟨 親 <@{game.parent_id}> の手番です。ROLL可能、STOPで確定。", view=view)
 
 @tree.command(name="chi_status", description="状態を表示")
 async def chi_status(inter: discord.Interaction):
@@ -665,5 +665,6 @@ if __name__ == "__main__":
         print("環境変数 DISCORD_TOKEN が設定されていません。")
     else:
         bot.run(TOKEN)
+
 
 
